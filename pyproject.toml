@@ -1,0 +1,12 @@
+[project]
+    name = "MQTTMixin"
+    version = "3.0.0"
+    description = "Async MQTT Client library, intended to be used as a Mixin"
+    requires-python = ">=3.8"
+    dependencies = [
+        "aiomqtt>=2.4.0"
+    ]
+
+    [build-system]
+    requires = ["setuptools>=61.0"]
+    build-backend = "setuptools.build_meta"

@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: MQTTMixin
+Version: 2.0.0
+Summary: Async MQTT Client library, intended to be used as a Mixin
+Requires-Python: >=3.8
+Requires-Dist: aiomqtt>=2.4.0
