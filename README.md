@@ -40,7 +40,7 @@ r = MyClass( myargs,
              log             = None
               )
 ```
-Where the variables are:
+Where the variables are:  
 ip              = MQTT broker ip as a string eg '192.168.100.16', default is None  
 port            = MQTT broker port eg 1883 (this is the default)  
 user            = optional MQTT user, default is None  
