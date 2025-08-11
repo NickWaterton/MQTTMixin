@@ -7,7 +7,7 @@ Async MQTT Client library, intended to be used as a Mixin
 import re
 from ast import literal_eval
 import logging
-from signal import SIGTERM, SIGINT
+from signal import SIGINT, SIGTERM
 import asyncio
 
 import aiomqtt
@@ -53,17 +53,29 @@ class MQTTMixin():
         self._method_dict = {}  #filled in later
         self._delimiter = r'\='
         self._topic_override = None
-        self._delimiter = r'\='
-        self._topic_override = None
         self._exit = False
         self._history = {}
         self._tasks = set()
-        self._add_signals()
+        self._publish_tasks = set()
+        #set up exit signals
+        self.add_signals()
         self._super_init(*args, **kwargs)
+        
+        self._loop = asyncio.get_running_loop()
 
         if self._broker is not None:
             self._add_task(self._connect_client())
             self._add_task(self._built_method_dict())
+            
+    def add_signals(self):
+        '''
+        setup signals to exit program
+        '''
+        try:    #might not work on windows
+            self._loop.add_signal_handler(SIGINT, self.mqtt_stop)
+            self._loop.add_signal_handler(SIGTERM, self.mqtt_stop)
+        except Exception:
+            self._log.warning('signal error')
                 
     def _super_init(self, *args, **kwargs):
         '''
@@ -103,7 +115,7 @@ class MQTTMixin():
                 break
                 
         self._log.debug('Callable functions initialized')             
-        self._setup_polling() 
+        self._setup_polling()
         
     def _setup_polling(self):            
         if self._polling_config:
@@ -116,27 +128,33 @@ class MQTTMixin():
         else:
             self._log.debug('Polling is disabled')
                 
-    def _add_signals(self):
-        '''
-        setup signals to exit program
-        '''
-        try:    #might not work on windows
-            asyncio.get_running_loop().add_signal_handler(SIGINT, self.mqtt_stop)
-            asyncio.get_running_loop().add_signal_handler(SIGTERM, self.mqtt_stop)
-        except Exception:
-            self._log.warning('signal error')
-                
     def _add_task(self, callback):
         '''
         add callback task to self._tasks and run as a background task
         '''
         try:
-            task = asyncio.create_task(callback)
+            #task = asyncio.create_task(callback)
+            task = self._loop.create_task(callback)
             self._tasks.add(task)
             task.add_done_callback(self._tasks.remove)
             return task
         except Exception as e:
             self._log.warning('task error: {}'.format(e))
+        return None
+        
+    def _add_publish_task(self, publish):
+        '''
+        add publish task to self._publish_tasks and run as a background task
+        '''
+        try:
+            #task = asyncio.create_task(self._async_publish(topic, message))
+            task = self._loop.create_task(publish)
+            self._publish_tasks.add(task)
+            task.add_done_callback(self._publish_tasks.remove)
+            return task
+        except Exception as e:
+            self._log.exception(e)
+            self._log.warning('publish task error: {}'.format(e))
         return None
                 
     async def _connect_client(self):
@@ -215,7 +233,7 @@ class MQTTMixin():
         else:
             await self.subscribe('{}/#'.format(self._topic))
         self._history = {}
-        await self._publish('status', 'Online')
+        await self._async_publish('status', 'Online')
         
     async def _process_mqtt_message(self, msg):
         '''
@@ -242,13 +260,13 @@ class MQTTMixin():
             pubtopic = '{}/{}'.format(pubtopic, topic)
         return pubtopic
         
-    def _sync_publish(self, topic=None, message=None):
+    def _publish(self, topic=None, message=None):
         '''
         runs self._publish as a task
         '''
-        asyncio.create_task(self._publish(topic, message))
+        self._add_publish_task(self._async_publish(topic, message))
             
-    async def _publish(self, topic=None, message=None):
+    async def _async_publish(self, topic=None, message=None):
         '''
         publishes message to topic
         '''
@@ -278,16 +296,16 @@ class MQTTMixin():
                     if cmd in self._method_dict.keys():
                         result = await self._method_dict[cmd]()
                         if self._json_out or not isinstance(result, dict):
-                            await self._publish(cmd, result)
+                            await self._async_publish(cmd, result)
                         else:
-                            await self._decode_topics(result)
+                            self._decode_topics(result)
                     else:
                         self._log.warning('Polling command: {cmd} not found')
         except asyncio.CancelledError:
             pass
         self._log.info('Poll loop exited')
                
-    async def _decode_topics(self, state, prefix=None, override=False):
+    def _decode_topics(self, state, prefix=None, override=False):
         '''
         decode json data dict, and _publish as individual topics to
         brokerFeedback/topic the keys are concatenated with _ to make one unique
@@ -297,9 +315,9 @@ class MQTTMixin():
         for k, v in state.items():
             if isinstance(v, dict):
                 if prefix is None:
-                    await self._decode_topics(v, k, override=override)
+                    self._decode_topics(v, k, override=override)
                 else:
-                    await self._decode_topics(v, '{}_{}'.format(prefix, k), override=override)
+                    self._decode_topics(v, '{}_{}'.format(prefix, k), override=override)
             else:
                 if isinstance(v, list):
                     newlist = []
@@ -314,7 +332,7 @@ class MQTTMixin():
                     k = '{}_{}'.format(prefix, k)
                  
                 if override or self._has_changed(k, v):
-                    await self._publish(k, str(v))
+                    self._publish(k, str(v))
                 
     def _has_changed(self, k, v):
         '''
@@ -373,9 +391,9 @@ class MQTTMixin():
             self._topic_override = None
             
         if self._json_out or not isinstance(value, dict):
-            await self._publish(command, value)
+            await self._async_publish(command, value)
         else:
-            await self._decode_topics(value, override=True)
+            self._decode_topics(value, override=True)
         
     async def _execute_command(self, command, args):
         '''
@@ -408,9 +426,6 @@ class MQTTMixin():
         return list(filter(lambda x: (x !=''), [x.strip() if isinstance(x, str) else x for x in fl]))
         
     def mqtt_stop(self):
-        '''
-        run _mqtt_stop as a task
-        '''
         asyncio.create_task(self._mqtt_stop())
         
     async def _mqtt_stop(self):
@@ -418,11 +433,14 @@ class MQTTMixin():
         Shutdown MQTT connection and stop all tasks
         '''
         self._log.info('received SIGINT/SIGTERM, shutting down')
-        self._exit = True
+        self._publish('status', 'Shutdown')
         if self._MQTT_connected:
-            await self._publish('status', 'Shutdown')
+            while len(self._publish_tasks) != 0:
+                self.log.debug('waiting for {} publish tasks to complete'.format(len(self._publish_tasks)))
+                await asyncio.sleep(1)
             self._mqttc._client.disconnect()
             self._mqttc = None
+        self._exit = True
         [task.cancel() for task in self._tasks if not task.done()]
         self._tasks = set()
         self._log.info('{} stopped'.format(self._name or 'MQTT'))
