@@ -7,27 +7,22 @@ Async MQTT Client library, intended to be used as a Mixin
 import re
 from ast import literal_eval
 import logging
-from signal import SIGINT, SIGTERM
+import signal
 import asyncio
 
 import aiomqtt
 
 __version__ = "3.0.0"
 
-class Will:
-    
-    def __init__(self, topic=None, payload=None, qos=0, retain=False, properties=None):
-        self.topic = topic
-        self.payload = payload
-        self.qos = qos
-        self.retain=retain
-        self.properties = properties
+logging.basicConfig(level=logging.INFO)
 
 class MQTTMixin():
     '''
     Async MQTT Mixin client intended to be used as a mixin
     all methods not starting with '_' can be sent as commands to MQTT topic
     feedback is published to pubtopic plus name (if given)
+    
+    pass will as an aiomqtt.Will() object (see default below)
     '''
     __version__ = __version__
     invalid_commands = ['start', 'stop', 'mqtt_stop', 'subscribe', 'unsubscribe', '']
@@ -46,7 +41,7 @@ class MQTTMixin():
         self._name = kwargs.pop("name", None)
         self._json_out = kwargs.pop("json_out", False)
         self._polling_config = kwargs.pop("poll", None)
-        self._will = kwargs.pop("will", None) or Will(topic=self._get_pubtopic('status'), payload="Offline", qos=0, retain=False)
+        self._will = kwargs.pop("will", None) or aiomqtt.Will(topic=self._get_pubtopic('status'), payload="Offline")
         self._polling = []
         self._poll = None
         self._mqttc = None
@@ -57,8 +52,7 @@ class MQTTMixin():
         self._history = {}
         self._tasks = set()
         self._publish_tasks = set()
-        #set up exit signals
-        self.add_signals()
+        self.__add_mqtt_signals()
         self._super_init(*args, **kwargs)
         
         self._loop = asyncio.get_running_loop()
@@ -67,15 +61,20 @@ class MQTTMixin():
             self._add_task(self._connect_client())
             self._add_task(self._built_method_dict())
             
-    def add_signals(self):
+    def __add_mqtt_signals(self):
         '''
         setup signals to exit program
+        NOTE: if the main class also adds signal handling it will override the settings here.
+        In which case the signal handler in the main class must call mqtt_stop or _mqtt_stop directly.
         '''
-        try:    #might not work on windows
-            self._loop.add_signal_handler(SIGINT, self.mqtt_stop)
-            self._loop.add_signal_handler(SIGTERM, self.mqtt_stop)
-        except Exception:
-            self._log.warning('signal error')
+        try:
+            def quit():
+                asyncio.create_task(self._mqtt_stop())
+            for sig in ['SIGINT', 'SIGTERM']:
+                if hasattr(signal, sig):
+                    asyncio.get_running_loop().add_signal_handler(getattr(signal, sig), quit)
+        except Exception as e:
+            self._log.warning('signal error: {}'.format(e))
                 
     def _super_init(self, *args, **kwargs):
         '''
@@ -184,7 +183,7 @@ class MQTTMixin():
             except Exception as e:
                 self._log.exception("Connection error: {}".format(e))
             await asyncio.sleep(5)
-        self._log.info('exited')
+        self._log.info('Exited')
         
     async def subscribe(self, topic, qos=0):
         '''
@@ -225,8 +224,10 @@ class MQTTMixin():
         self._topic/all/# and 
         self._topic/self._name/# if name is defined in self._name or
         self._topic/# if self._name not defined
+        sets pending_calls_threshold to 100 to avoid annoying warnings (normally 10)
         '''
         self._log.info('MQTT broker connected')
+        self._mqttc.pending_calls_threshold = 100
         await self.subscribe('{}/all/#'.format(self._topic))
         if self._name:
             await self.subscribe('{}/{}/#'.format(self._topic, self._name))
@@ -426,7 +427,10 @@ class MQTTMixin():
         return list(filter(lambda x: (x !=''), [x.strip() if isinstance(x, str) else x for x in fl]))
         
     def mqtt_stop(self):
-        asyncio.create_task(self._mqtt_stop())
+        '''
+        run _mqtt_stop as a task and keep a reference to task
+        '''
+        self.stop_task = self._loop.create_task(self._mqtt_stop())
         
     async def _mqtt_stop(self):
         '''
@@ -435,12 +439,15 @@ class MQTTMixin():
         self._log.info('received SIGINT/SIGTERM, shutting down')
         self._publish('status', 'Shutdown')
         if self._MQTT_connected:
-            while len(self._publish_tasks) != 0:
-                self.log.debug('waiting for {} publish tasks to complete'.format(len(self._publish_tasks)))
-                await asyncio.sleep(1)
+            self._log.info('waiting for publish tasks to end')
+            await asyncio.gather(*self._publish_tasks)
+            self._log.info('publish tasks done')
             self._mqttc._client.disconnect()
             self._mqttc = None
         self._exit = True
         [task.cancel() for task in self._tasks if not task.done()]
+        self._log.info('waiting for tasks to end')
+        await asyncio.gather(*self._tasks)
+        self._log.info('tasks done')
         self._tasks = set()
         self._log.info('{} stopped'.format(self._name or 'MQTT'))
